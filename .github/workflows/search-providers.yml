@@ -1,0 +1,30 @@
+name: Search providers (nightly)
+
+# The SearchProvider contract suite against OpenSearch and Elasticsearch (heavy containers).
+# Meilisearch runs in every CI build as part of test:e2e.
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+
+jobs:
+  providers:
+    name: OpenSearch · Elasticsearch contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npx vitest run --config ./vitest.config.e2e.ts test/search-providers.e2e-spec.ts
+        env:
+          SEARCH_PROVIDERS: opensearch,elasticsearch

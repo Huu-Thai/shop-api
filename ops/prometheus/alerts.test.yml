@@ -1,0 +1,94 @@
+# promtool unit tests for alerts.yml:  npm run ops:check
+rule_files:
+  - alerts.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: API down for a minute pages
+    interval: 1m
+    input_series:
+      - series: 'up{job="shop-api", instance="api:3000"}'
+        values: '1 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: ShopApiDown
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: ShopApiDown
+        exp_alerts:
+          - exp_labels: { severity: critical, job: shop-api, instance: 'api:3000' }
+            exp_annotations:
+              summary: 'API instance api:3000 is not answering metrics scrapes'
+              runbook_url: docs/RUNBOOK.md#api-or-worker-down
+
+  - name: 5xx above 2% for five minutes pages; quiet traffic doesn't
+    interval: 1m
+    input_series:
+      # 100 requests a minute, 5 of them 500s.
+      - series: 'shop_http_request_duration_seconds_count{route="/api/v1/store/config", method="GET", status="200"}'
+        values: '0+95x15'
+      - series: 'shop_http_request_duration_seconds_count{route="/api/v1/store/config", method="GET", status="500"}'
+        values: '0+5x15'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: ShopHighErrorRate
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: ShopHighErrorRate
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: '5% of requests fail with 5xx (SLO: < 1%)'
+              runbook_url: docs/RUNBOOK.md#errors-or-slow-responses
+
+  - name: An after-event stuck for five minutes is critical
+    interval: 1m
+    input_series:
+      - series: 'shop_outbox_oldest_seconds{role="api", instance="a"}'
+        values: '0 60 400 460 520 580 640 700 760'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: OutboxStuck
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: OutboxStuck
+        exp_alerts:
+          - exp_labels: { severity: critical }
+            exp_annotations:
+              summary: 'An after-event has waited 12m 40s: listeners (stock, search, points, webhooks) are behind'
+              runbook_url: docs/RUNBOOK.md#outbox-backlog
+
+  - name: Payment failure rate needs volume
+    interval: 1m
+    input_series:
+      - series: 'shop_payments_total{provider="STRIPE", outcome="failed", role="api"}'
+        values: '0+1x15'
+      - series: 'shop_payments_total{provider="STRIPE", outcome="captured", role="api"}'
+        values: '0+1x15'
+    alert_rule_test:
+      # Half the payments fail, but 6 payments are too few to page.
+      - eval_time: 3m
+        alertname: PaymentFailureRateHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: PaymentFailureRateHigh
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: '50% of payments failed in 15 minutes'
+              runbook_url: docs/RUNBOOK.md#a-payment-is-stuck-or-the-shopper-paid-but-the-order-says-unpaid
+
+  - name: A switched-off webhook warns
+    interval: 1m
+    input_series:
+      - series: 'shop_webhooks_disabled{role="api", instance="a"}'
+        values: '0 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: WebhookDisabled
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations:
+              summary: '1 outgoing webhook(s) were switched off after failures'
+              runbook_url: docs/RUNBOOK.md#an-integration-stopped-receiving-webhooks

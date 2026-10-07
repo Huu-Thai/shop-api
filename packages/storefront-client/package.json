@@ -1,0 +1,25 @@
+{
+  "name": "@shop/storefront-client",
+  "version": "1.0.0",
+  "description": "Typed client for the Shop storefront API (generated from openapi/storefront.json)",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "openapi-fetch": "^0.17.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

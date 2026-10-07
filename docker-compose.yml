@@ -1,0 +1,230 @@
+# Local stack for shop.
+#   docker compose up -d                → infrastructure only (run the app with npm run start:dev)
+#   docker compose --profile app up -d  → also migrate + api + worker containers
+#   docker compose --profile search up -d → also Meilisearch (switch a website to it in the admin)
+#   docker compose --profile app --profile monitoring up -d → also Prometheus (:9091), Alertmanager
+#     (:9094, alerts e-mailed to Mailpit) and Grafana (:3301, dashboard "Shop overview")
+# Host ports are overridable (SHOP_*_PORT); defaults avoid clashes with the fuzzer-scanner stack.
+
+name: shop
+
+x-app-env: &app-env
+  NODE_ENV: ${NODE_ENV:-development}
+  LOG_FORMAT: json
+  DATABASE_URL: postgresql://shop:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/shop?schema=public
+  DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-20}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+  AUTH_JWT_SECRET: ${AUTH_JWT_SECRET:?AUTH_JWT_SECRET is required}
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  S3_ENDPOINT: http://minio:9000
+  # Signed links (export downloads) must be reachable from the browser.
+  S3_PUBLIC_ENDPOINT: ${S3_PUBLIC_ENDPOINT:-http://localhost:${SHOP_MINIO_PORT:-9200}}
+  S3_REGION: us-east-1
+  S3_BUCKET: ${S3_BUCKET:-shop-media}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-shop}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY is required}
+  S3_FORCE_PATH_STYLE: 'true'
+  # Seals stored engine/payment credentials (openssl rand -hex 32).
+  APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
+  # Public origin of the API: payment providers send notifications here (https in production).
+  API_PUBLIC_URL: ${API_PUBLIC_URL:-https://api.shop.localhost}
+  # Bearer token for /api/v1/metrics and the worker's :9464/metrics (Prometheus sends it).
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  WORKER_METRICS_PORT: 9464
+  # Requests per minute per principal / IP (raise for load tests run from one machine).
+  THROTTLE_LIMIT: ${THROTTLE_LIMIT:-300}
+  STOREFRONT_CACHE_TTL_S: ${STOREFRONT_CACHE_TTL_S:-30}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: shop
+    ports: ['127.0.0.1:${SHOP_POSTGRES_PORT:-5434}:5432']
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U shop -d shop']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Authentication is mandatory; compose refuses to start without a password.
+    command:
+      [
+        'sh',
+        '-c',
+        'exec redis-server --requirepass "$$REDIS_PASSWORD" --appendonly yes',
+      ]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    ports: ['127.0.0.1:${SHOP_REDIS_PORT:-6390}:6379']
+    volumes: [redis_data:/data]
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'redis-cli -a "$$REDIS_PASSWORD" --no-auth-warning ping | grep PONG',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ':9001'
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:-shop}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY is required}
+    ports:
+      [
+        '127.0.0.1:${SHOP_MINIO_PORT:-9200}:9000',
+        '127.0.0.1:${SHOP_MINIO_CONSOLE_PORT:-9201}:9001',
+      ]
+    volumes: [minio_data:/data]
+    healthcheck:
+      test: ['CMD', 'mc', 'ready', 'local']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-off: creates the private media bucket.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-shop}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?S3_SECRET_ACCESS_KEY is required}
+      S3_BUCKET: ${S3_BUCKET:-shop-media}
+    entrypoint: ['/bin/sh', '/init/minio-init.sh']
+    volumes: ['./docker/minio-init.sh:/init/minio-init.sh:ro']
+    restart: 'no'
+
+  # Catches every outgoing e-mail (order confirmations, password resets) — UI on :8026.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      [
+        '127.0.0.1:${SHOP_SMTP_PORT:-1026}:1025',
+        '127.0.0.1:${SHOP_MAILPIT_PORT:-8026}:8025',
+      ]
+    healthcheck:
+      test: ['CMD', '/mailpit', 'readyz']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Optional external search engine (PLAN.md §9.5); Postgres full text is the default.
+  meilisearch:
+    profiles: [search]
+    image: getmeili/meilisearch:v1.13
+    restart: unless-stopped
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY:?MEILI_MASTER_KEY is required for the search profile}
+      MEILI_NO_ANALYTICS: 'true'
+      MEILI_ENV: production
+    ports: ['127.0.0.1:${SHOP_MEILI_PORT:-7701}:7700']
+    volumes: [meili_data:/meili_data]
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf http://127.0.0.1:7700/health || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    profiles: [app]
+    build: { context: ., target: migrate }
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: 'no'
+
+  api:
+    profiles: [app]
+    build: { context: ., target: api }
+    environment: *app-env
+    ports: ['127.0.0.1:${SHOP_API_PORT:-3300}:3000']
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      minio-init: { condition: service_completed_successfully }
+    restart: unless-stopped
+
+  worker:
+    profiles: [app]
+    build: { context: ., target: worker }
+    environment: *app-env
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:9464/health >/dev/null || exit 1']
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ─── Monitoring (PLAN.md §11): metrics, alert rules, dashboards ───
+  prometheus:
+    profiles: [monitoring]
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    environment:
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    # The scrape token comes from the environment (Prometheus reads it from a file).
+    entrypoint:
+      [
+        '/bin/sh',
+        '-c',
+        'printf %s "$$METRICS_TOKEN" > /tmp/metrics-token && exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=15d --web.enable-lifecycle',
+      ]
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    ports: ['127.0.0.1:${SHOP_PROMETHEUS_PORT:-9091}:9090']
+
+  alertmanager:
+    profiles: [monitoring]
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    command: ['--config.file=/etc/alertmanager/alertmanager.yml', '--storage.path=/alertmanager']
+    volumes:
+      - ./ops/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports: ['127.0.0.1:${SHOP_ALERTMANAGER_PORT:-9094}:9093']
+    depends_on: [mailpit]
+
+  grafana:
+    profiles: [monitoring]
+    image: grafana/grafana:12.1.1
+    restart: unless-stopped
+    environment:
+      # Local only (bound to 127.0.0.1); set GRAFANA_ADMIN_PASSWORD for anything shared.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+      GF_AUTH_ANONYMOUS_ENABLED: 'false'
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/shop-overview.json
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports: ['127.0.0.1:${SHOP_GRAFANA_PORT:-3301}:3000']
+    depends_on: [prometheus]
+
+volumes:
+  prometheus_data:
+  grafana_data:
+  meili_data:
+  postgres_data:
+  redis_data:
+  minio_data:

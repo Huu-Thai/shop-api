@@ -1,0 +1,35 @@
+# Scrapes the API and the worker (Bearer METRICS_TOKEN, written to /tmp/metrics-token by the
+# container entrypoint) and evaluates the alert rules. Used by `docker compose --profile monitoring`;
+# in Kubernetes, keep the rules file and replace the static targets with service discovery.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    service: shop
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+scrape_configs:
+  - job_name: shop-api
+    metrics_path: /api/v1/metrics
+    authorization:
+      credentials_file: /tmp/metrics-token
+    static_configs:
+      - targets: ['api:3000']
+
+  - job_name: shop-worker
+    metrics_path: /metrics
+    authorization:
+      credentials_file: /tmp/metrics-token
+    static_configs:
+      - targets: ['worker:9464']
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']

@@ -1,0 +1,431 @@
+import { createHash } from 'node:crypto';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  NotFoundException,
+  PayloadTooLargeException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import sharp, { type Metadata } from 'sharp';
+import {
+  actorOf,
+  type Principal,
+  SYSTEM_ACTOR,
+} from '../../common/auth/principal.js';
+import { paginated, type Paginated } from '../../common/dto/pagination.dto.js';
+import { assertUniqueLocales } from '../../common/dto/translation.dto.js';
+import {
+  BeforeWriteEvent,
+  EntityEvent,
+  ProjectionEvent,
+} from '../../common/events/entity.events.js';
+import { TransactionalEventBus } from '../../common/events/transactional-event-bus.js';
+import type { AppConfig } from '../../config/configuration.js';
+import type {
+  ImageOwnerType,
+  Prisma,
+} from '../../database/generated/prisma/client.js';
+import { PrismaService } from '../../database/prisma.service.js';
+import { StorageService } from '../../storage/storage.service.js';
+import type {
+  ImageDto,
+  ImageLinkDto,
+  ListImagesQueryDto,
+  SetImageLinksDto,
+  UpdateImageDto,
+} from './dto/image.dto.js';
+import {
+  ALLOWED_FORMATS,
+  type ImageFormat,
+  IMMUTABLE,
+  originalKey,
+  type Rendition,
+} from './image-keys.js';
+import {
+  IMAGE_EVENTS,
+  type ImageEventData,
+  type ImageLinksWriteInput,
+} from './media.events.js';
+
+/** Decompression-bomb guard: refuse images above ~40 megapixels. */
+export const MAX_PIXELS = 40_000_000;
+
+const SELECT = {
+  id: true,
+  storageKey: true,
+  checksum: true,
+  mime: true,
+  width: true,
+  height: true,
+  bytes: true,
+  originalFilename: true,
+  renditions: true,
+  createdAt: true,
+  translations: {
+    select: { localeCode: true, alt: true },
+    orderBy: { localeCode: 'asc' },
+  },
+  _count: { select: { links: true } },
+} as const satisfies Prisma.ImageSelect;
+type Row = Prisma.ImageGetPayload<{ select: typeof SELECT }>;
+/** An image without its URLs (the controller adds them; signing is per request). */
+export type ImageData = Omit<ImageDto, 'url' | 'thumbnailUrl'>;
+
+const toDto = ({ translations, _count, renditions, ...i }: Row): ImageData => ({
+  ...i,
+  renditions: Object.values(
+    (renditions ?? {}) as unknown as Record<string, Rendition>,
+  ).sort((a, b) => a.width - b.width),
+  alts: translations,
+  linkCount: _count.links,
+});
+
+export interface UploadedFile {
+  buffer: Buffer;
+  originalname?: string;
+  size: number;
+}
+
+/** Inspects bytes (never trusts the client's content type). */
+export async function inspectImage(
+  buffer: Buffer,
+): Promise<{ format: ImageFormat; width: number; height: number }> {
+  let meta: Metadata;
+  try {
+    meta = await sharp(buffer, { limitInputPixels: MAX_PIXELS }).metadata();
+  } catch {
+    throw new BadRequestException('The file is not a readable image');
+  }
+  const format = meta.format as string;
+  if (!(format in ALLOWED_FORMATS))
+    throw new BadRequestException(
+      `Unsupported image format ${format}; use ${Object.keys(ALLOWED_FORMATS).join(', ')}`,
+    );
+  if (!meta.width || !meta.height)
+    throw new BadRequestException('The image has no dimensions');
+  if (meta.width * meta.height > MAX_PIXELS)
+    throw new BadRequestException(
+      `The image exceeds ${MAX_PIXELS / 1e6} megapixels`,
+    );
+  // EXIF orientations 5–8 swap width and height.
+  const swap = (meta.orientation ?? 1) >= 5;
+  return {
+    format: format as ImageFormat,
+    width: swap ? meta.height : meta.width,
+    height: swap ? meta.width : meta.height,
+  };
+}
+
+@Injectable()
+export class ImagesService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly bus: TransactionalEventBus,
+    private readonly storage: StorageService,
+    private readonly config: ConfigService<AppConfig, true>,
+  ) {}
+
+  async list(q: ListImagesQueryDto): Promise<Paginated<ImageData>> {
+    const where: Prisma.ImageWhereInput = q.search
+      ? { originalFilename: { contains: q.search, mode: 'insensitive' } }
+      : {};
+    const [rows, total] = await Promise.all([
+      this.prisma.image.findMany({
+        where,
+        select: SELECT,
+        orderBy: { createdAt: q.order },
+        skip: q.skip,
+        take: q.limit,
+      }),
+      this.prisma.image.count({ where }),
+    ]);
+    return paginated(rows.map(toDto), total, q);
+  }
+
+  async getMany(ids: readonly string[]): Promise<ImageData[]> {
+    if (!ids.length) return [];
+    const rows = await this.prisma.image.findMany({
+      where: { id: { in: [...ids] } },
+      select: SELECT,
+    });
+    return rows.map(toDto);
+  }
+
+  async get(id: string): Promise<ImageData> {
+    const i = await this.prisma.image.findUnique({
+      where: { id },
+      select: SELECT,
+    });
+    if (!i) throw new NotFoundException(`Image ${id} not found`);
+    return toDto(i);
+  }
+
+  /**
+   * Stores the original under a content-addressed key, then records it. Uploading the same bytes
+   * again returns the existing image. Renditions are generated by the media worker (image.created).
+   */
+  async upload(
+    file: UploadedFile | undefined,
+    alt: { localeCode?: string; alt?: string },
+    actor: Principal,
+  ): Promise<ImageData> {
+    if (!file?.buffer?.length)
+      throw new BadRequestException('Send the image as multipart field "file"');
+    const max = this.config.get('media', { infer: true }).maxUploadBytes;
+    if (file.size > max)
+      throw new PayloadTooLargeException(
+        `Images are limited to ${Math.round(max / 1048576)} MB`,
+      );
+    if (alt.alt && !alt.localeCode)
+      throw new BadRequestException('localeCode is required with alt');
+    const { format, width, height } = await inspectImage(file.buffer);
+    const checksum = createHash('sha256').update(file.buffer).digest('hex');
+    const existing = await this.prisma.image.findUnique({
+      where: { checksum },
+      select: SELECT,
+    });
+    if (existing) return toDto(existing);
+
+    const key = originalKey(checksum, format);
+    await this.storage.putObject(
+      key,
+      file.buffer,
+      ALLOWED_FORMATS[format],
+      IMMUTABLE,
+    );
+    return this.bus.write({
+      before: new BeforeWriteEvent(
+        IMAGE_EVENTS.BEFORE_WRITE,
+        'create',
+        null,
+        actorOf(actor),
+        { checksum },
+      ),
+      work: async (tx, after) => {
+        const i = await tx.image.create({
+          data: {
+            storageKey: key,
+            checksum,
+            mime: ALLOWED_FORMATS[format],
+            width,
+            height,
+            bytes: file.size,
+            originalFilename: file.originalname?.slice(0, 255) ?? null,
+            createdById: actor.type === 'admin' ? actor.id : null,
+            translations: alt.alt
+              ? { create: [{ localeCode: alt.localeCode!, alt: alt.alt }] }
+              : undefined,
+          },
+          select: SELECT,
+        });
+        after.add(
+          new EntityEvent<ImageEventData>(
+            IMAGE_EVENTS.CREATED,
+            actorOf(actor),
+            'image',
+            i.id,
+            { key, width, height, bytes: file.size },
+            { imageId: i.id },
+          ),
+        );
+        return toDto(i);
+      },
+    });
+  }
+
+  async update(
+    id: string,
+    dto: UpdateImageDto,
+    actor: Principal,
+  ): Promise<ImageData> {
+    assertUniqueLocales(dto.alts, 'alts');
+    return this.bus.write({
+      before: new BeforeWriteEvent(
+        IMAGE_EVENTS.BEFORE_WRITE,
+        'update',
+        id,
+        actorOf(actor),
+        dto,
+      ),
+      work: async (tx, after) => {
+        const exists = await tx.image.findUnique({
+          where: { id },
+          select: { id: true },
+        });
+        if (!exists) throw new NotFoundException(`Image ${id} not found`);
+        await tx.imageTranslation.deleteMany({ where: { imageId: id } });
+        await tx.imageTranslation.createMany({
+          data: dto.alts.map((a) => ({ imageId: id, ...a })),
+        });
+        after.add(
+          new EntityEvent<ImageEventData>(
+            IMAGE_EVENTS.UPDATED,
+            actorOf(actor),
+            'image',
+            id,
+            { alts: dto.alts },
+            { imageId: id },
+          ),
+        );
+        return toDto(
+          await tx.image.findUniqueOrThrow({ where: { id }, select: SELECT }),
+        );
+      },
+    });
+  }
+
+  /** Linked images need `force` (links are removed with the image). Objects are deleted after commit. */
+  async remove(id: string, force: boolean, actor: Principal): Promise<void> {
+    await this.bus.write({
+      before: new BeforeWriteEvent(
+        IMAGE_EVENTS.BEFORE_WRITE,
+        'delete',
+        id,
+        actorOf(actor),
+      ),
+      work: async (tx, after) => {
+        const i = await tx.image.findUnique({ where: { id }, select: SELECT });
+        if (!i) throw new NotFoundException(`Image ${id} not found`);
+        if (i._count.links && !force)
+          throw new ConflictException(
+            `The image is used ${i._count.links} time(s); pass force=true to delete it anyway`,
+          );
+        await tx.image.delete({ where: { id } });
+        const keys = [i.storageKey, ...toDto(i).renditions.map((r) => r.key)];
+        after.add(
+          new EntityEvent<ImageEventData>(
+            IMAGE_EVENTS.DELETED,
+            actorOf(actor),
+            'image',
+            id,
+            { key: i.storageKey, links: i._count.links },
+            { imageId: id, keys },
+          ),
+        );
+      },
+    });
+  }
+
+  async links(
+    ownerType: ImageOwnerType,
+    ownerId: string,
+  ): Promise<ImageLinkDto[]> {
+    return this.prisma.imageLink.findMany({
+      where: { ownerType, ownerId },
+      select: { imageId: true, role: true, position: true },
+      orderBy: [{ position: 'asc' }, { role: 'asc' }],
+    });
+  }
+
+  /** Replaces an owner's images. The owner's module vetoes unknown owners (image-links.before-write). */
+  async setLinks(
+    ownerType: ImageOwnerType,
+    ownerId: string,
+    dto: SetImageLinksDto,
+    actor: Principal,
+  ): Promise<ImageLinkDto[]> {
+    const keys = dto.images.map((l) => `${l.imageId}/${l.role}`);
+    if (new Set(keys).size !== keys.length)
+      throw new BadRequestException(
+        'An image is linked twice with the same role',
+      );
+    for (const role of ['BASE', 'SMALL', 'THUMBNAIL'] as const)
+      if (dto.images.filter((l) => l.role === role).length > 1)
+        throw new BadRequestException(`Only one ${role} image per owner`);
+    await this.bus.write({
+      before: new BeforeWriteEvent<ImageLinksWriteInput>(
+        IMAGE_EVENTS.LINKS_BEFORE_WRITE,
+        'set',
+        ownerId,
+        actorOf(actor),
+        { ownerType, ownerId },
+      ),
+      work: async (tx, after) => {
+        const ids = [...new Set(dto.images.map((l) => l.imageId))];
+        const found = await tx.image.count({ where: { id: { in: ids } } });
+        if (found !== ids.length)
+          throw new BadRequestException('One or more images do not exist');
+        await tx.imageLink.deleteMany({ where: { ownerType, ownerId } });
+        await tx.imageLink.createMany({
+          data: dto.images.map((l, i) => ({
+            ownerType,
+            ownerId,
+            imageId: l.imageId,
+            role: l.role,
+            position: l.position ?? i,
+          })),
+        });
+        after.add(
+          new EntityEvent(
+            IMAGE_EVENTS.LINKS_CHANGED,
+            actorOf(actor),
+            ownerType.toLowerCase(),
+            ownerId,
+            { images: dto.images.map((l) => `${l.role}:${l.imageId}`) },
+            { ownerType, ownerId },
+          ),
+        );
+      },
+    });
+    return this.links(ownerType, ownerId);
+  }
+
+  /** Projection cleanup when an owner disappears (listener on the owner's deleted events). */
+  async removeOwnerLinks(
+    ownerType: ImageOwnerType,
+    ownerId: string,
+  ): Promise<void> {
+    await this.bus.write({
+      before: new BeforeWriteEvent(
+        IMAGE_EVENTS.LINKS_BEFORE_WRITE,
+        'owner-removed',
+        ownerId,
+        SYSTEM_ACTOR,
+        { ownerType, ownerId, ownerRemoved: true },
+      ),
+      work: async (tx, after) => {
+        const { count } = await tx.imageLink.deleteMany({
+          where: { ownerType, ownerId },
+        });
+        if (count)
+          after.add(
+            new ProjectionEvent(IMAGE_EVENTS.LINKS_CHANGED, {
+              ownerType,
+              ownerId,
+              removed: count,
+            }),
+          );
+      },
+    });
+  }
+
+  /** Called by the media worker once renditions are stored. */
+  async setRenditions(imageId: string, renditions: Rendition[]): Promise<void> {
+    await this.bus.write({
+      before: new BeforeWriteEvent(
+        IMAGE_EVENTS.BEFORE_WRITE,
+        'renditions',
+        imageId,
+        SYSTEM_ACTOR,
+      ),
+      work: async (tx, after) => {
+        const { count } = await tx.image.updateMany({
+          where: { id: imageId },
+          data: {
+            renditions: Object.fromEntries(
+              renditions.map((r) => [String(r.width), r]),
+            ) as unknown as Prisma.InputJsonObject,
+          },
+        });
+        if (count)
+          after.add(
+            new ProjectionEvent(IMAGE_EVENTS.RENDITIONS_READY, {
+              imageId,
+              widths: renditions.map((r) => r.width),
+            }),
+          );
+      },
+    });
+  }
+}

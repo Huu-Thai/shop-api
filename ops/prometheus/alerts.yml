@@ -1,0 +1,179 @@
+# Alerts for shop. Every alert links to its runbook section (docs/RUNBOOK.md); thresholds follow the
+# SLOs in that runbook. Checked with `npm run ops:check` (promtool check + unit tests in alerts.test.yml).
+groups:
+  - name: shop-slo-recording
+    rules:
+      - record: shop:http_requests:rate5m
+        expr: sum(rate(shop_http_request_duration_seconds_count[5m]))
+      - record: shop:http_errors:ratio5m
+        expr: |
+          sum(rate(shop_http_request_duration_seconds_count{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(shop_http_request_duration_seconds_count[5m])), 1e-9)
+      - record: shop:storefront_read_latency_p95:5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(
+            shop_http_request_duration_seconds_bucket{method="GET", route=~"/api/v1/store/.*", route!~"/api/v1/store/(cart|orders).*"}[5m])))
+      - record: shop:checkout_latency_p95:5m
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(
+            shop_http_request_duration_seconds_bucket{method=~"POST|PUT|PATCH", route=~"/api/v1/store/(cart|orders).*"}[5m])))
+
+  - name: shop-availability
+    rules:
+      - alert: ShopApiDown
+        expr: up{job="shop-api"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: 'API instance {{ $labels.instance }} is not answering metrics scrapes'
+          runbook_url: docs/RUNBOOK.md#api-or-worker-down
+      - alert: ShopWorkerDown
+        expr: up{job="shop-worker"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: 'Worker {{ $labels.instance }} is down: background jobs, webhooks and checkout housekeeping stop'
+          runbook_url: docs/RUNBOOK.md#api-or-worker-down
+      - alert: ShopHighErrorRate
+        expr: shop:http_errors:ratio5m > 0.02 and shop:http_requests:rate5m > 1
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: '{{ $value | humanizePercentage }} of requests fail with 5xx (SLO: < 1%)'
+          runbook_url: docs/RUNBOOK.md#errors-or-slow-responses
+
+  - name: shop-slo
+    rules:
+      - alert: StorefrontLatencyHigh
+        expr: shop:storefront_read_latency_p95:5m > 0.3
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: 'Storefront reads p95 is {{ $value | humanizeDuration }} (SLO: 300 ms)'
+          runbook_url: docs/RUNBOOK.md#errors-or-slow-responses
+      - alert: CheckoutLatencyHigh
+        expr: shop:checkout_latency_p95:5m > 1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: 'Cart and checkout writes p95 is {{ $value | humanizeDuration }} (SLO: 1 s)'
+          runbook_url: docs/RUNBOOK.md#errors-or-slow-responses
+
+  - name: shop-background
+    rules:
+      - alert: QueueBacklog
+        expr: max by (queue) (shop_queue_jobs{state="waiting"}) > 1000
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $value }} jobs waiting in queue {{ $labels.queue }}'
+          runbook_url: docs/RUNBOOK.md#queue-backlog-or-failing-jobs
+      - alert: QueueJobsFailing
+        expr: sum by (queue) (increase(shop_queue_job_duration_seconds_count{outcome="failed"}[15m])) > 10
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $value | humanize }} jobs failed in queue {{ $labels.queue }} in 15 minutes'
+          runbook_url: docs/RUNBOOK.md#queue-backlog-or-failing-jobs
+      - alert: OutboxStuck
+        expr: max(shop_outbox_oldest_seconds) > 300
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: 'An after-event has waited {{ $value | humanizeDuration }}: listeners (stock, search, points, webhooks) are behind'
+          runbook_url: docs/RUNBOOK.md#outbox-backlog
+      - alert: OutboxDeadLetters
+        expr: max(shop_outbox_dead_letters) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $value }} after-events were parked after repeated failures'
+          runbook_url: docs/RUNBOOK.md#outbox-backlog
+      - alert: JobExecutionFailed
+        expr: sum by (type) (increase(shop_job_executions_total{status="FAILED"}[30m])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: 'A {{ $labels.type }} job failed'
+          runbook_url: docs/RUNBOOK.md#a-job-import-or-export-failed
+      - alert: JobsQueuedTooLong
+        expr: max(shop_job_executions_queued_oldest_seconds) > 900
+        labels: { severity: warning }
+        annotations:
+          summary: 'A job execution has been queued for {{ $value | humanizeDuration }}'
+          runbook_url: docs/RUNBOOK.md#a-job-import-or-export-failed
+
+  - name: shop-payments
+    rules:
+      - alert: PaymentsReconciliationLagging
+        expr: max(shop_payments_pending_stale) > 0
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $value }} payments pending for more than 15 minutes'
+          runbook_url: docs/RUNBOOK.md#a-payment-is-stuck-or-the-shopper-paid-but-the-order-says-unpaid
+      - alert: PaymentFailureRateHigh
+        expr: |
+          sum(increase(shop_payments_total{outcome="failed"}[15m]))
+            / clamp_min(sum(increase(shop_payments_total{outcome=~"captured|failed"}[15m])), 1) > 0.3
+          and sum(increase(shop_payments_total{outcome=~"captured|failed"}[15m])) >= 10
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $value | humanizePercentage }} of payments failed in 15 minutes'
+          runbook_url: docs/RUNBOOK.md#a-payment-is-stuck-or-the-shopper-paid-but-the-order-says-unpaid
+      - alert: PaymentWebhookSignatureFailures
+        expr: sum(increase(shop_payment_webhooks_total{result="invalid-signature"}[15m])) > 5
+        labels: { severity: warning }
+        annotations:
+          summary: 'Payment notifications fail signature checks (wrong credentials, or forged requests)'
+          runbook_url: docs/RUNBOOK.md#a-payment-is-stuck-or-the-shopper-paid-but-the-order-says-unpaid
+      - alert: RefundFailed
+        expr: sum(increase(shop_payments_total{outcome="refund-failed"}[1h])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: 'A refund failed at the payment provider'
+          runbook_url: docs/RUNBOOK.md#a-refund-failed-or-is-pending
+
+  - name: shop-integrations
+    rules:
+      - alert: WebhookDisabled
+        expr: max(shop_webhooks_disabled) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $value }} outgoing webhook(s) were switched off after failures'
+          runbook_url: docs/RUNBOOK.md#an-integration-stopped-receiving-webhooks
+      - alert: WebhookDeliveriesFailing
+        expr: sum(increase(shop_webhook_deliveries_total{outcome="failed"}[30m])) > 0
+        labels: { severity: warning }
+        annotations:
+          summary: 'Webhook deliveries failed after all their retries'
+          runbook_url: docs/RUNBOOK.md#an-integration-stopped-receiving-webhooks
+
+  - name: shop-security
+    rules:
+      - alert: SignInFailureSpike
+        expr: sum by (realm) (increase(shop_auth_failures_total[5m])) > 50
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $value | humanize }} failed {{ $labels.realm }} sign-ins in 5 minutes (credential stuffing?)'
+          runbook_url: docs/RUNBOOK.md#a-burst-of-failed-sign-ins
+
+  - name: shop-runtime
+    rules:
+      - alert: EventLoopLagHigh
+        expr: max by (role, instance) (shop_nodejs_eventloop_lag_p99_seconds) > 0.5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $labels.role }} {{ $labels.instance }}: event loop lag p99 {{ $value | humanizeDuration }}'
+          runbook_url: docs/RUNBOOK.md#errors-or-slow-responses
+      - alert: MemoryHigh
+        expr: max by (role, instance) (shop_process_resident_memory_bytes) > 1.5e9
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $labels.role }} {{ $labels.instance }} uses {{ $value | humanize1024 }}B'
+          runbook_url: docs/RUNBOOK.md#errors-or-slow-responses
+      - alert: ProcessRestarting
+        expr: changes(shop_process_start_time_seconds[30m]) > 3
+        labels: { severity: warning }
+        annotations:
+          summary: '{{ $labels.role }} {{ $labels.instance }} restarted {{ $value }} times in 30 minutes'
+          runbook_url: docs/RUNBOOK.md#api-or-worker-down
